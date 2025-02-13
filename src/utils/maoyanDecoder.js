@@ -100,6 +100,7 @@ const isFluctuationReasonable = (currentValue, prevValue, key) => {
  * 优化的HTML实体解码函数
  */
 const decodeHtmlEntity = (text, fontStyle, key = 'default') => {
+  
   if (!text || !fontStyle) return '0';
   
   try {

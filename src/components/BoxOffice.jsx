@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import confetti from 'canvas-confetti';
 import { motion, AnimatePresence } from 'framer-motion';
 import React from 'react';
@@ -425,148 +425,482 @@ const triggerCelebration = () => {
   }, 800);
 };
 
-// 优化主组件
-export default function BoxOffice({ movieId = '1294273' }) {
-  const [rawData, setRawData] = useState(null);
-  const processedData = useBoxOfficeData(rawData);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState(null);
-  const wsRef = React.useRef(null);
-  
-  // 使用 useRef 存储最新的数据
-  const boxOfficeDataRef = React.useRef(processedData);
-  boxOfficeDataRef.current = processedData;
+// 优化 WebSocket Hook
+const useWebSocket = (movieId) => {
+  // WebSocket 通道定义
+  const channels = {
+    HEARTBEAT: 'heartbeat',
+    DATA: 'data',
+    ERROR: 'error',
+    STATUS: 'status'
+  };
 
-  const handleWebSocketMessage = React.useCallback((event) => {
-    try {
-      const data = JSON.parse(event.data);
-      const movieData = {
-        ...data?.movieList?.list?.[0],
-        fontStyle: data.fontStyle,
-        showCount: data?.movieList?.list?.[0]?.showCount || '0',
-        viewCountDesc: data?.movieList?.nationBoxInfo?.viewCountDesc || '0',
-        showCountDesc: data?.movieList?.nationBoxInfo?.showCountDesc || '0',
-        sumBoxDesc: data?.movieList?.list?.[0]?.sumBoxDesc || '0万'
-      };
-      setRawData(movieData);
-      setError(null);
-    } catch (err) {
-      console.error('数据处理错误:', err);
-    } finally {
-      setLoading(false);
+  const [data, setData] = useState(null);
+  const [status, setStatus] = useState('connecting');
+  const wsRef = useRef(null);
+  const reconnectTimeoutRef = useRef(null);
+  const reconnectAttemptsRef = useRef(0);
+  const lastMessageTimeRef = useRef(Date.now());
+  const [heartbeatStatus, setHeartbeatStatus] = useState('inactive');
+  const [connectionMetrics, setConnectionMetrics] = useState({
+    latency: 0,
+    messageCount: 0,
+    lastUpdate: null
+  });
+
+  // 配置
+  const config = {
+    MAX_RECONNECT_ATTEMPTS: 5,
+    RECONNECT_DELAY: 3000,
+    HEARTBEAT_TIMEOUT: 35000,
+    METRICS_UPDATE_INTERVAL: 5000,
+    INITIAL_RETRY_DELAY: 1000,
+    MAX_RETRY_DELAY: 30000
+  };
+
+  // 消息处理器
+  const messageHandlers = useMemo(() => ({
+    [channels.HEARTBEAT]: (message) => {
+      setHeartbeatStatus('active');
+      lastMessageTimeRef.current = message.timestamp;
+      // 更新连接指标
+      if (message.data?.metrics) {
+        setConnectionMetrics(prev => ({
+          ...prev,
+          ...message.data.metrics,
+          lastUpdate: Date.now()
+        }));
+      }
+      // 发送 pong 响应
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify({
+          type: 'pong',
+          timestamp: Date.now()
+        }));
+      }
+    },
+
+    [channels.DATA]: (message) => {
+      if (message.data?.movieList?.list?.[0]) {
+        const movieData = {
+          ...message.data.movieList.list[0],
+          fontStyle: message.data.fontStyle,
+          showCount: message.data.movieList.list[0].showCount || '0',
+          viewCountDesc: message.data.movieList.nationBoxInfo?.viewCountDesc || '0',
+          showCountDesc: message.data.movieList.nationBoxInfo?.showCountDesc || '0',
+          sumBoxDesc: message.data.movieList.list[0].sumBoxDesc || '0万'
+        };
+        setData(movieData);
+        setStatus('updated');
+      }
+    },
+
+    [channels.ERROR]: (message) => {
+      console.error('WebSocket错误:', message.data);
+      setStatus('error');
+    },
+
+    [channels.STATUS]: (message) => {
+      setStatus(message.data.status);
     }
-  }, []);
+  }), []);
 
-  const connectWebSocket = React.useCallback(() => {
-    // 如果已经有连接且连接是开启状态，不要重新连接
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
+  // 消息处理函数
+  const handleMessage = useCallback((event) => {
+    try {
+      const { channel, data, timestamp } = JSON.parse(event.data);
+      const handler = messageHandlers[channel];
+      
+      if (handler) {
+        handler({ data, timestamp });
+      } else {
+        console.warn('未知的消息通道:', channel);
+      }
+    } catch (err) {
+      console.error('消息处理错误:', err);
+    }
+  }, [messageHandlers]);
+
+  // 计算下一次重试延迟
+  const getNextRetryDelay = useCallback(() => {
+    const baseDelay = config.INITIAL_RETRY_DELAY;
+    const exponentialDelay = baseDelay * Math.pow(2, reconnectAttemptsRef.current);
+    return Math.min(exponentialDelay, config.MAX_RETRY_DELAY);
+  }, [config.INITIAL_RETRY_DELAY, config.MAX_RETRY_DELAY]);
+
+  // 重连函数
+  const reconnect = useCallback(() => {
+    if (reconnectAttemptsRef.current >= config.MAX_RECONNECT_ATTEMPTS) {
+      console.warn(`达到最大重连次数 (${config.MAX_RECONNECT_ATTEMPTS})`);
+      setStatus('failed');
       return;
     }
 
-    // 如果有旧连接，先关闭
-    if (wsRef.current) {
-      wsRef.current.close();
+    if (reconnectTimeoutRef.current) {
+      clearTimeout(reconnectTimeoutRef.current);
     }
 
-    const ws = new WebSocket('wss://boxoffice.dongpoding.workers.dev');
-    wsRef.current = ws;
+    const delay = getNextRetryDelay();
+    console.log(`第 ${reconnectAttemptsRef.current + 1} 次重连，延迟 ${delay}ms`);
 
-    ws.onopen = () => {
-      console.log('WebSocket连接已建立');
-      ws.send(movieId);
-      setError(null);
-      setLoading(false);
-    };
+    reconnectTimeoutRef.current = setTimeout(() => {
+      reconnectAttemptsRef.current++;
+      connectWebSocket();
+    }, delay);
+  }, [getNextRetryDelay]);
 
-    ws.onmessage = handleWebSocketMessage;
-
-    ws.onerror = (error) => {
-      console.error('WebSocket错误:', error);
-      setError('连接发生错误');
-      setLoading(false);
-    };
-
-    ws.onclose = (event) => {
-      console.log('WebSocket连接已关闭，代码:', event.code);
-      // 只有在非正常关闭时才重连
-      if (event.code !== 1000 && event.code !== 1001) {
-        setTimeout(connectWebSocket, 3000);
+  // WebSocket 连接函数
+  const connectWebSocket = useCallback(() => {
+    try {
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+        console.log('WebSocket 已连接');
+        return;
       }
-    };
-  }, [movieId, handleWebSocketMessage]);
 
-  useEffect(() => {
-    connectWebSocket();
-    return () => {
+      if (wsRef.current?.readyState === WebSocket.CONNECTING) {
+        console.log('WebSocket 正在连接中');
+        return;
+      }
+
+      // 清理现有连接
       if (wsRef.current) {
-        wsRef.current.close(1000, '组件卸载');
+        wsRef.current.close();
+        wsRef.current = null;
+      }
+
+      console.log('开始建立新的 WebSocket 连接');
+      const ws = new WebSocket('wss://boxoffice.dongpoding.workers.dev');
+      wsRef.current = ws;
+
+      ws.onopen = () => {
+        console.log('WebSocket 连接成功');
+        setStatus('connected');
+        setHeartbeatStatus('active');
+        reconnectAttemptsRef.current = 0;
+        // 发送初始化消息
+        ws.send(JSON.stringify({
+          type: 'init',
+          movieId,
+          timestamp: Date.now()
+        }));
+      };
+
+      ws.onmessage = handleMessage;
+
+      ws.onerror = (error) => {
+        console.error('WebSocket 连接错误:', error);
+        setStatus('error');
+        setHeartbeatStatus('inactive');
+      };
+
+      ws.onclose = (event) => {
+        console.log(`WebSocket 连接关闭: ${event.code} ${event.reason}`);
+        setStatus('disconnected');
+        setHeartbeatStatus('inactive');
+        
+        // 只有在非正常关闭时才重连
+        if (event.code !== 1000) {
+          reconnect();
+        }
+      };
+
+      return () => {
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.close(1000, "正常关闭");
+        }
+      };
+    } catch (error) {
+      console.error('WebSocket 连接异常:', error);
+      setStatus('error');
+      reconnect();
+    }
+  }, [movieId, handleMessage, reconnect]);
+
+  // 心跳检查
+  useEffect(() => {
+    const heartbeatCheck = setInterval(() => {
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+        const timeSinceLastMessage = Date.now() - lastMessageTimeRef.current;
+        if (timeSinceLastMessage > config.HEARTBEAT_TIMEOUT) {
+          console.warn('心跳超时，准备重连');
+          setHeartbeatStatus('timeout');
+          if (wsRef.current) {
+            wsRef.current.close(4000, "心跳超时");
+          }
+        }
+      }
+    }, config.HEARTBEAT_TIMEOUT);
+
+    return () => clearInterval(heartbeatCheck);
+  }, [config.HEARTBEAT_TIMEOUT]);
+
+  // 初始连接
+  useEffect(() => {
+    console.log('初始化 WebSocket 连接');
+    connectWebSocket();
+
+    return () => {
+      console.log('清理 WebSocket 连接');
+      if (wsRef.current) {
+        wsRef.current.close(1000, "组件卸载");
+      }
+      if (reconnectTimeoutRef.current) {
+        clearTimeout(reconnectTimeoutRef.current);
       }
     };
   }, [connectWebSocket]);
 
-  if (loading) return (
-    <div className="flex items-center justify-center min-h-screen bg-gradient-to-br from-gray-900 via-purple-900 to-violet-900">
-      <div className="text-center">
-        <div className="w-16 h-16 border-4 border-white border-t-transparent rounded-full animate-spin mb-4"></div>
-        <p className="text-white/80 text-lg">正在获取实时数据...</p>
-      </div>
-    </div>
+  return {
+    data,
+    status,
+    heartbeatStatus,
+    connectionMetrics,
+    connectionStatus: wsRef.current?.readyState
+  };
+};
+
+// 添加状态提示组件
+const ConnectionStatus = React.memo(({ status, error }) => {
+  return (
+    <AnimatePresence>
+      {(status === 'disconnected' || status === 'error' || status === 'failed') && (
+        <motion.div
+          initial={{ opacity: 0, y: -20 }}
+          animate={{ opacity: 1, y: 0 }}
+          exit={{ opacity: 0, y: -20 }}
+          className="fixed top-4 right-4 z-50"
+        >
+          <div className="bg-white/10 backdrop-blur-lg rounded-lg border border-white/20 p-4 shadow-lg">
+            <div className="flex items-center gap-3">
+              {status === 'disconnected' && (
+                <div className="flex items-center gap-2">
+                  <div className="w-2 h-2 bg-yellow-500 rounded-full animate-pulse"></div>
+                  <span className="text-yellow-400">正在重新连接...</span>
+                </div>
+              )}
+              {status === 'error' && (
+                <div className="flex items-center gap-2">
+                  <div className="w-2 h-2 bg-red-500 rounded-full"></div>
+                  <span className="text-red-400">连接出现错误</span>
+                </div>
+              )}
+              {status === 'failed' && (
+                <div className="flex items-center gap-2">
+                  <div className="w-2 h-2 bg-red-500 rounded-full"></div>
+                  <span className="text-red-400">连接失败</span>
+                  <motion.button
+                    onClick={() => window.location.reload()}
+                    className="px-2 py-1 bg-red-500/20 hover:bg-red-500/30 text-red-400 rounded-md text-sm"
+                    whileHover={{ scale: 1.05 }}
+                    whileTap={{ scale: 0.95 }}
+                  >
+                    刷新页面
+                  </motion.button>
+                </div>
+              )}
+            </div>
+          </div>
+        </motion.div>
+      )}
+    </AnimatePresence>
   );
+});
+
+// 优化主组件
+export default function BoxOffice({ movieId = '1294273' }) {
+  const { 
+    data: rawData, 
+    status, 
+    heartbeatStatus,
+    connectionMetrics,
+    connectionStatus 
+  } = useWebSocket(movieId);
   
-  if (error) return (
-    <div className="flex items-center justify-center min-h-screen bg-gradient-to-br from-gray-900 via-purple-900 to-violet-900">
-      <div className="text-center text-white/80 p-8 bg-white/10 backdrop-blur-lg rounded-2xl">
-        <span className="text-4xl mb-4 block">😢</span>
-        <p className="text-xl">{error}</p>
-        <p className="text-sm mt-2 text-white/60">正在尝试重新连接...</p>
+  const processedData = useBoxOfficeData(rawData);
+  const [error, setError] = useState(null);
+  const [isCelebrating, setIsCelebrating] = useState(false);
+  const celebrationInterval = useRef(null);
+  const prevDataRef = useRef(null);
+
+  // 保存上一次的有效数据
+  useEffect(() => {
+    if (rawData && status === 'connected') {
+      prevDataRef.current = rawData;
+    }
+  }, [rawData, status]);
+
+  // 使用当前数据或上一次的有效数据
+  const displayData = rawData || prevDataRef.current;
+  const currentProcessedData = useBoxOfficeData(displayData);
+
+  // 状态监听
+  useEffect(() => {
+    switch (status) {
+      case 'connected':
+        setError(null);
+        break;
+      case 'disconnected':
+        setError('连接已断开');
+        break;
+      case 'error':
+        setError('连接错误');
+        break;
+      case 'failed':
+        setError('连接失败');
+        break;
+    }
+  }, [status]);
+
+  // 检查是否超过100亿并触发动画
+  useEffect(() => {
+    const boxOffice = parseFloat(processedData.displayValue);
+    if (boxOffice >= 100 && !isCelebrating) {
+      setIsCelebrating(true);
+    }
+  }, [processedData.displayValue]);
+
+  // 控制持续动画
+  useEffect(() => {
+    if (isCelebrating) {
+      celebrationInterval.current = setInterval(() => {
+        triggerCelebration();
+      }, 3000); // 每3秒触发一次
+    } else if (celebrationInterval.current) {
+      clearInterval(celebrationInterval.current);
+      celebrationInterval.current = null;
+    }
+
+    return () => {
+      if (celebrationInterval.current) {
+        clearInterval(celebrationInterval.current);
+      }
+    };
+  }, [isCelebrating]);
+
+  // 清理函数
+  useEffect(() => {
+    return () => {
+      if (celebrationInterval.current) {
+        clearInterval(celebrationInterval.current);
+      }
+    };
+  }, []);
+
+  // 停止动画的处理函数
+  const handleStopCelebration = () => {
+    setIsCelebrating(false);
+  };
+
+  // 渲染连接状态指示器
+  const renderConnectionStatus = () => {
+    const getStatusColor = () => {
+      switch (heartbeatStatus) {
+        case 'active':
+          return 'bg-green-500';
+        case 'timeout':
+          return 'bg-red-500';
+        default:
+          return 'bg-yellow-500';
+      }
+    };
+
+    return (
+      <div className="flex items-center gap-2 text-white/60 text-sm">
+        <span className={`w-2 h-2 rounded-full ${getStatusColor()} animate-pulse`}></span>
+        <span>
+          {connectionMetrics.lastUpdate ? 
+            `${Math.floor((Date.now() - connectionMetrics.lastUpdate) / 1000)}秒前更新` : 
+            '等待更新...'}
+        </span>
+        {status !== 'connected' && (
+          <>
+            <span className="w-1 h-1 rounded-full bg-white/40"></span>
+            <span className="text-yellow-400">
+              {status === 'disconnected' ? '正在重连...' : 
+               status === 'error' ? '连接错误' : 
+               status === 'failed' ? '连接失败' : ''}
+            </span>
+          </>
+        )}
       </div>
-    </div>
-  );
-  
-  if (!processedData) return (
-    <div className="flex items-center justify-center min-h-screen bg-gradient-to-br from-gray-900 via-purple-900 to-violet-900">
-      <p className="text-white/80 text-xl">暂无数据</p>
-    </div>
-  );
+    );
+  };
+
+  if (!displayData) {
+    return (
+      <div className="flex items-center justify-center min-h-screen bg-gradient-to-br from-gray-900 via-purple-900 to-violet-900">
+        <motion.div 
+          className="text-center"
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          transition={{ duration: 0.5 }}
+        >
+          <div className="w-16 h-16 border-4 border-white border-t-transparent rounded-full animate-spin mb-4"></div>
+          <p className="text-white/80 text-lg">正在获取实时数据...</p>
+        </motion.div>
+      </div>
+    );
+  }
 
   return (
     <div className="h-screen bg-gradient-to-br from-gray-900 via-purple-900 to-violet-900 p-6">
+      <ConnectionStatus status={status} error={error} />
       <div className="h-full flex flex-col gap-6">
-        {/* 头部信息 - 减小高度 */}
+        {/* 头部信息 */}
         <div className="flex justify-between items-center bg-white/5 backdrop-blur-lg rounded-3xl p-4 border border-white/10">
           <div className="flex items-center gap-8">
             <div>
               <motion.h1 
                 className="text-4xl lg:text-5xl font-bold bg-gradient-to-r from-white via-white/90 to-white/80 bg-clip-text text-transparent"
               >
-                {rawData?.movieInfo?.movieName || '加载中...'}
+                {displayData?.movieInfo?.movieName || '加载中...'}
               </motion.h1>
               <div className="flex items-center gap-2 text-white/60 text-sm mt-1">
-                <span className="flex items-center gap-1">
-                  <span className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse"></span>
-                  上映第 {(rawData?.movieInfo?.releaseInfo || '0').replace('上映', '').replace('天', '')} 天
-                </span>
+                {renderConnectionStatus()}
                 <span className="w-1 h-1 rounded-full bg-white/40"></span>
                 <span>全国热映中</span>
               </div>
             </div>
             
-            {/* 测试按钮 */}
-            <motion.button
-              onClick={triggerCelebration}
-              className="px-4 py-2 bg-green-500/20 hover:bg-green-500/30 text-green-400 rounded-xl border border-green-500/30"
-              whileHover={{ scale: 1.05 }}
-              whileTap={{ scale: 0.95 }}
-            >
-              测试票房动画
-            </motion.button>
+            <div className="flex gap-4">
+              {/* 测试按钮 */}
+              <motion.button
+                onClick={triggerCelebration}
+                className="px-4 py-2 bg-green-500/20 hover:bg-green-500/30 text-green-400 rounded-xl border border-green-500/30"
+                whileHover={{ scale: 1.05 }}
+                whileTap={{ scale: 0.95 }}
+              >
+                测试票房动画
+              </motion.button>
+
+              {/* 停止动画按钮 */}
+              {isCelebrating && (
+                <motion.button
+                  onClick={handleStopCelebration}
+                  className="px-4 py-2 bg-red-500/20 hover:bg-red-500/30 text-red-400 rounded-xl border border-red-500/30"
+                  whileHover={{ scale: 1.05 }}
+                  whileTap={{ scale: 0.95 }}
+                  initial={{ opacity: 0, x: -20 }}
+                  animate={{ opacity: 1, x: 0 }}
+                  exit={{ opacity: 0, x: 20 }}
+                >
+                  停止庆祝动画
+                </motion.button>
+              )}
+            </div>
           </div>
           
+          {/* 连接指标 */}
           <div className="text-right bg-white/5 rounded-xl p-2">
-            <p className="text-xs text-white/60">实时数据更新</p>
-            <p className="text-lg font-mono text-white/90 tabular-nums">
-              {new Date().toLocaleTimeString()}
-            </p>
+            <p className="text-xs text-white/60">连接状态</p>
+            <div className="flex flex-col gap-1 text-sm">
+              <p className="text-white/90">
+                活跃连接: {connectionMetrics.connections || 0}
+              </p>
+              <p className="text-white/90">
+                缓存数量: {connectionMetrics.cacheSize || 0}
+              </p>
+            </div>
           </div>
         </div>
 
@@ -607,31 +941,31 @@ export default function BoxOffice({ movieId = '1294273' }) {
             <div className="grid grid-cols-4 gap-4">
               <DataCard 
                 title="今日排片场次" 
-                value={rawData?.showCount || '0'}
-                subtitle={`排片占比：${rawData?.showCountRate || '0%'}`}
+                value={displayData?.showCount || '0'}
+                subtitle={`排片占比：${displayData?.showCountRate || '0%'}`}
                 icon="🎬"
-                trend={parseFloat(rawData?.showCountRate) > 30 ? 'up' : 'down'}
+                trend={parseFloat(displayData?.showCountRate) > 30 ? 'up' : 'down'}
               />
               <DataCard 
                 title="今日场均人次" 
-                value={rawData?.avgShowView || '0'}
-                subtitle={`同档期第${rawData?.avgShowViewRank || '1'}名`}
+                value={displayData?.avgShowView || '0'}
+                subtitle={`同档期第${displayData?.avgShowViewRank || '1'}名`}
                 icon="👥"
-                trend={parseInt(rawData?.avgShowViewRank) <= 2 ? 'up' : 'down'}
+                trend={parseInt(displayData?.avgShowViewRank) <= 2 ? 'up' : 'down'}
               />
               <DataCard 
                 title="上座率" 
-                value={rawData?.avgSeatView || '0%'}
-                subtitle={`${rawData?.splitBoxRate || '0%'} 票房占比`}
+                value={displayData?.avgSeatView || '0%'}
+                subtitle={`${displayData?.splitBoxRate || '0%'} 票房占比`}
                 icon="🎫"
-                trend={parseFloat(rawData?.splitBoxRate) > 30 ? 'up' : 'down'}
+                trend={parseFloat(displayData?.splitBoxRate) > 30 ? 'up' : 'down'}
               />
               <DataCard 
                 title="大盘贡献" 
-                value={rawData?.boxRate || '0%'}
+                value={displayData?.boxRate || '0%'}
                 subtitle="实时票房占比"
                 icon="📊"
-                trend={parseFloat(rawData?.boxRate) > 30 ? 'up' : 'down'}
+                trend={parseFloat(displayData?.boxRate) > 30 ? 'up' : 'down'}
               />
             </div>
           </div>
