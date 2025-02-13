@@ -224,18 +224,21 @@ const BoxOfficeProgress = ({ value, total }) => {
 };
 
 // 优化电影轮播图组件
-const MovieCarousel = React.memo(({ movieId }) => {
+const MovieCarousel = React.memo(({ movieId, movieName, imgUrl }) => {
   const [currentIndex, setCurrentIndex] = useState(0);
   const [isDragging, setIsDragging] = useState(false);
   const [dragStartX, setDragStartX] = useState(0);
   const containerRef = React.useRef(null);
   const autoPlayRef = React.useRef(null);
 
-  const images = [
-    { url: nezha2Banner1, alt: "哪吒之破晓飞升" },
-    { url: nezha2Banner2, alt: "哪吒之破晓飞升" },
-    { url: nezha2Banner3, alt: "哪吒之破晓飞升" }
-  ];
+  // 默认占位图片
+  const defaultImage = {
+    url: 'data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iODAwIiBoZWlnaHQ9IjQwMCIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj48cmVjdCB3aWR0aD0iODAwIiBoZWlnaHQ9IjQwMCIgZmlsbD0iIzFhMWIxZSIvPjx0ZXh0IHg9IjQwMCIgeT0iMjAwIiBmb250LWZhbWlseT0iQXJpYWwiIGZvbnQtc2l6ZT0iMzAiIGZpbGw9IiM2YjcyODAiIHRleHQtYW5jaG9yPSJtaWRkbGUiIGRvbWluYW50LWJhc2VsaW5lPSJtaWRkbGUiPuaaguaXoOWbvueJhzwvdGV4dD48L3N2Zz4=',
+    alt: movieName || '暂无图片'
+  };
+
+  // 使用服务器返回的图片
+  const images = imgUrl ? [{ url: imgUrl, alt: movieName }] : [defaultImage];
 
   // 自动播放
   useEffect(() => {
@@ -479,8 +482,9 @@ const useWebSocket = (movieId) => {
         }));
       }
     },
-
     [channels.DATA]: (message) => {
+      console.log("收到新数据，电影ID:", movieId);
+      console.log("服务器返回数据:", message.data);
       if (message.data?.movieList?.list?.[0]) {
         const movieData = {
           ...message.data.movieList.list[0],
@@ -488,8 +492,14 @@ const useWebSocket = (movieId) => {
           showCount: message.data.movieList.list[0].showCount || '0',
           viewCountDesc: message.data.movieList.nationBoxInfo?.viewCountDesc || '0',
           showCountDesc: message.data.movieList.nationBoxInfo?.showCountDesc || '0',
-          sumBoxDesc: message.data.movieList.list[0].sumBoxDesc || '0万'
+          sumBoxDesc: message.data.movieList.list[0].sumBoxDesc || '0万',
+          movieInfo: {
+            ...message.data.movieInfo,
+            movieName: message.data.movieInfo?.movieInfo?.name || '加载中...',
+            imgUrl: message.data.movieInfo?.movieInfo?.imgUrl
+          }
         };
+        console.log("处理后的电影数据:", movieData);
         setData(movieData);
         setStatus('updated');
       }
@@ -553,7 +563,13 @@ const useWebSocket = (movieId) => {
   const connectWebSocket = useCallback(() => {
     try {
       if (wsRef.current?.readyState === WebSocket.OPEN) {
-        console.log('WebSocket 已连接');
+        console.log('WebSocket 已连接，发送新的电影ID:', movieId);
+        // 发送新的电影ID
+        wsRef.current.send(JSON.stringify({
+          type: 'init',
+          movieId,
+          timestamp: Date.now()
+        }));
         return;
       }
 
@@ -573,7 +589,7 @@ const useWebSocket = (movieId) => {
       wsRef.current = ws;
 
       ws.onopen = () => {
-        console.log('WebSocket 连接成功');
+        console.log('WebSocket 连接成功，初始化电影ID:', movieId);
         setStatus('connected');
         setHeartbeatStatus('active');
         reconnectAttemptsRef.current = 0;
@@ -615,6 +631,19 @@ const useWebSocket = (movieId) => {
       reconnect();
     }
   }, [movieId, handleMessage, reconnect]);
+
+  // 监听电影ID变化
+  useEffect(() => {
+    console.log('电影ID变化，新ID:', movieId);
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      console.log('发送新的电影ID到WebSocket');
+      wsRef.current.send(JSON.stringify({
+        type: 'init',
+        movieId,
+        timestamp: Date.now()
+      }));
+    }
+  }, [movieId]);
 
   // 心跳检查
   useEffect(() => {
@@ -706,8 +735,130 @@ const ConnectionStatus = React.memo(({ status, error }) => {
   );
 });
 
+// 添加电影配置组件
+const MovieConfig = React.memo(({ currentMovieId, onMovieChange }) => {
+  const [isOpen, setIsOpen] = useState(false);
+  const [inputValue, setInputValue] = useState(currentMovieId);
+  const [errorMessage, setErrorMessage] = useState('');
+
+  const popularMovies = [
+    { id: '1294273', name: '哪吒之破晓飞升' },
+    { id: '1298542', name: '熊出没·逆转时空' },
+    { id: '1461145', name: '红毯先生' },
+    { id: '1303', name: '流浪地球2' }
+  ];
+
+  const handleSubmit = (e) => {
+    e.preventDefault();
+    if (!inputValue) {
+      setErrorMessage('请输入电影ID');
+      return;
+    }
+    if (!/^\d+$/.test(inputValue)) {
+      setErrorMessage('电影ID必须是数字');
+      return;
+    }
+    onMovieChange(inputValue);
+    setIsOpen(false);
+    setErrorMessage('');
+  };
+
+  return (
+    <div className="relative">
+      <motion.button
+        onClick={() => setIsOpen(!isOpen)}
+        className="fixed top-4 left-4 z-50 px-4 py-2 bg-white/10 hover:bg-white/20 backdrop-blur-lg rounded-xl border border-white/20 text-white/80 flex items-center gap-2"
+        whileHover={{ scale: 1.05 }}
+        whileTap={{ scale: 0.95 }}
+      >
+        <span className="text-lg">⚙️</span>
+        <span>电影配置</span>
+      </motion.button>
+
+      <AnimatePresence>
+        {isOpen && (
+          <motion.div
+            initial={{ opacity: 0, scale: 0.9 }}
+            animate={{ opacity: 1, scale: 1 }}
+            exit={{ opacity: 0, scale: 0.9 }}
+            className="fixed top-16 left-4 z-50 p-6 bg-white/10 backdrop-blur-lg rounded-2xl border border-white/20 shadow-xl w-80"
+          >
+            <h3 className="text-white/80 text-lg mb-4 font-semibold">选择电影</h3>
+            
+            {/* 热门电影列表 */}
+            <div className="space-y-2 mb-6">
+              <p className="text-white/60 text-sm mb-2">热门电影</p>
+              {popularMovies.map(movie => (
+                <motion.button
+                  key={movie.id}
+                  onClick={() => {
+                    setInputValue(movie.id);
+                    onMovieChange(movie.id);
+                    setIsOpen(false);
+                  }}
+                  className={`w-full px-3 py-2 rounded-lg text-left text-sm ${
+                    currentMovieId === movie.id
+                      ? 'bg-white/20 text-white'
+                      : 'bg-white/5 text-white/70 hover:bg-white/10'
+                  }`}
+                  whileHover={{ scale: 1.02 }}
+                  whileTap={{ scale: 0.98 }}
+                >
+                  {movie.name}
+                  <span className="text-white/40 text-xs ml-2">ID: {movie.id}</span>
+                </motion.button>
+              ))}
+            </div>
+
+            {/* 自定义电影ID输入 */}
+            <form onSubmit={handleSubmit} className="space-y-4">
+              <div>
+                <p className="text-white/60 text-sm mb-2">自定义电影ID</p>
+                <input
+                  type="text"
+                  value={inputValue}
+                  onChange={(e) => {
+                    setInputValue(e.target.value);
+                    setErrorMessage('');
+                  }}
+                  className="w-full px-3 py-2 bg-white/5 border border-white/10 rounded-lg text-white placeholder-white/30 focus:outline-none focus:border-white/30"
+                  placeholder="输入电影ID..."
+                />
+                {errorMessage && (
+                  <p className="text-red-400 text-xs mt-1">{errorMessage}</p>
+                )}
+              </div>
+              
+              <div className="flex justify-end gap-2">
+                <motion.button
+                  type="button"
+                  onClick={() => setIsOpen(false)}
+                  className="px-4 py-2 bg-white/5 hover:bg-white/10 rounded-lg text-white/60"
+                  whileHover={{ scale: 1.05 }}
+                  whileTap={{ scale: 0.95 }}
+                >
+                  取消
+                </motion.button>
+                <motion.button
+                  type="submit"
+                  className="px-4 py-2 bg-blue-500/20 hover:bg-blue-500/30 text-blue-400 rounded-lg"
+                  whileHover={{ scale: 1.05 }}
+                  whileTap={{ scale: 0.95 }}
+                >
+                  确认
+                </motion.button>
+              </div>
+            </form>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
+  );
+});
+
 // 优化主组件
-export default function BoxOffice({ movieId = '1294273' }) {
+export default function BoxOffice({ initialMovieId = '1294273' }) {
+  const [movieId, setMovieId] = useState(initialMovieId);
   const { 
     data: rawData, 
     status, 
@@ -732,6 +883,7 @@ export default function BoxOffice({ movieId = '1294273' }) {
   // 使用当前数据或上一次的有效数据
   const displayData = rawData || prevDataRef.current;
   const currentProcessedData = useBoxOfficeData(displayData);
+  console.log("displayData: ", displayData)
 
   // 状态监听
   useEffect(() => {
@@ -844,6 +996,7 @@ export default function BoxOffice({ movieId = '1294273' }) {
 
   return (
     <div className="h-screen bg-gradient-to-br from-gray-900 via-purple-900 to-violet-900 p-6">
+      {/* <MovieConfig currentMovieId={movieId} onMovieChange={setMovieId} /> */}
       <ConnectionStatus status={status} error={error} />
       <div className="h-full flex flex-col gap-6">
         {/* 头部信息 */}
@@ -972,7 +1125,11 @@ export default function BoxOffice({ movieId = '1294273' }) {
 
           {/* 右侧轮播图 */}
           <div className="col-span-4">
-            <MovieCarousel movieId={movieId} />
+            <MovieCarousel 
+              movieId={movieId} 
+              movieName={displayData?.movieInfo?.movieName}
+              imgUrl={displayData?.movieInfo?.imgUrl} 
+            />
           </div>
         </div>
 
