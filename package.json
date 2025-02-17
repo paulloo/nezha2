@@ -7,7 +7,7 @@
     "start": "astro dev",
     "build": "astro build",
     "preview": "astro preview",
-    "vercel-build": "astro build",
+    "vercel-build": "cross-env NODE_ENV=production astro build",
     "deploy": "vercel --prod",
     "astro": "astro"
   },
